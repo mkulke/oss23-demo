@@ -1,5 +1,6 @@
-FROM rust:1.71-slim-bullseye as builder
-ARG KBS_COMMIT=81f3de7
+FROM rust:1.72.1-slim-bookworm as builder
+ARG KBS_COMMIT=6ae89b4
+ARG KBS_REPO=https://github.com/mkulke/kbs.git
 
 RUN apt-get update && apt-get install -y curl gnupg2
 RUN curl -L https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key | apt-key add -
@@ -9,6 +10,7 @@ RUN apt-get update && apt-get install -y \
 	clang \
 	git \
 	libsgx-dcap-quote-verify-dev \
+	libssl-dev \
 	libtdx-attest-dev \
 	libtss2-dev \
 	openssl \
@@ -17,10 +19,10 @@ RUN apt-get update && apt-get install -y \
 RUN curl -LO https://go.dev/dl/go1.20.7.linux-amd64.tar.gz
 RUN tar -C /usr/local -xzf go1.20.7.linux-amd64.tar.gz
 ENV PATH=$PATH:/usr/local/go/bin
-RUN git clone https://github.com/confidential-containers/kbs.git -b main /build
+RUN git clone $KBS_REPO -b main /build
 WORKDIR /build
 RUN git checkout $KBS_COMMIT
-RUN cargo b --release -p kbs
+RUN make background-check-kbs AS_TYPES=coco-as COCO_AS_INTEGRATION_TYPE=builtin
 
 FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y curl gnupg2
@@ -38,5 +40,6 @@ COPY --from=builder /build/target/release/kbs /kbs
 RUN mkdir -p "${KBS_REPO_PATH}/default/key"
 RUN mkdir -p "${KBS_REPO_PATH}/default/credential"
 # we need a default credential object for cc_kbc to work
-RUN echo '{"auths":{}}' > "${KBS_REPO_PATH}/default/credential/test"
-CMD ["/kbs", "--socket", "0.0.0.0:8080", "--insecure-http", "--auth-public-key", "/kbs.pem" ]
+RUN echo '{"auths": {}}' > "${KBS_REPO_PATH}/default/credential/test"
+RUN echo '{"sockets": ["0.0.0.0:8080"], "insecure_http": true, "auth_public_key": "/kbs.pem"}' > /config.json
+CMD ["/kbs", "--config-file", "/config.json" ]
