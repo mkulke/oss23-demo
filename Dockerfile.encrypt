@@ -1,0 +1,71 @@
+FROM rust:1.75-slim-bookworm as builder
+ARG GUEST_COMPONENTS_COMMIT=f20d4b59aa62032e82bd8d8107e6874d9618db50
+
+RUN apt-get update && apt-get install -y \
+	build-essential \
+	git \
+	libssl-dev \
+	pkg-config \
+	protobuf-compiler
+
+RUN git clone https://github.com/confidential-containers/guest-components.git -b main /build
+WORKDIR /build
+RUN git checkout $GUEST_COMPONENTS_COMMIT
+RUN rustup component add rustfmt
+RUN cargo b --release -p coco_keyprovider
+
+FROM golang:1.21.6-bookworm as skopeo
+RUN apt-get update && apt-get install -y \
+	make\
+	libgpgme-dev \
+	libassuan-dev \
+	libbtrfs-dev \
+	libdevmapper-dev \
+	pkg-config
+RUN git clone https://github.com/containers/skopeo -b main $GOPATH/src/github.com/containers/skopeo 
+WORKDIR $GOPATH/src/github.com/containers/skopeo
+RUN git checkout v1.14.1
+ENV DISABLE_DOCS=1
+RUN make bin/skopeo
+RUN make install
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+	ca-certificates \
+	libdevmapper1.02.1 \
+	libgpgme11 \
+	--no-install-recommends
+COPY --from=builder /build/target/release/coco_keyprovider /usr/local/bin/coco_keyprovider
+COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
+COPY <<EOF /etc/ocicrypt.conf
+{
+	"key-providers": {
+		"attestation-agent": {
+			"grpc": "localhost:50000"
+		}
+	}
+}
+EOF
+ENV OCICRYPT_KEYPROVIDER_CONFIG="/etc/ocicrypt.conf"
+COPY <<"EOF" /encrypt.sh
+#!/bin/bash
+
+set -euo pipefail
+
+if [ "$(printenv KEY_B64 | base64 -d | wc --bytes)" != "32" ]; then
+	echo "KEY_B64 must be set to base64-encoded 32-byte key"
+	exit 1
+fi
+KEY_PATH=/key
+printenv KEY_B64 | base64 -d > "$KEY_PATH"
+
+coco_keyprovider --socket 127.0.0.1:50000 &
+sleep 1
+
+KEY_PROVIDER_PARAMS="provider:attestation-agent:keypath=${KEY_PATH}::keyid=kbs:///${KEY_ID}::algorithm=A256GCM"
+skopeo copy \
+	--insecure-policy \
+	--encryption-key "$KEY_PROVIDER_PARAMS" \
+	docker://busybox:stable dir:/output
+EOF
+RUN chmod +x /encrypt.sh
